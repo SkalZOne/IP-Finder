@@ -1,5 +1,6 @@
 """HTTP с файловым кэшем, ретраями и приоритетом IPv4."""
 
+import hashlib
 import json
 import socket
 import time
@@ -20,9 +21,17 @@ USER_AGENT = "ip-finder/0.1"
 MAX_AGE = 7 * 24 * 3600
 
 
-def fetch_text(url, params=None, *, max_age=MAX_AGE, tries=4, timeout=30.0, validate=None) -> str:
-    """GET с кэшем. Кэш проверяется до сети, ошибки в него не пишутся."""
-    key = url + "?" + urlencode(sorted((params or {}).items()))
+def fetch_text(
+    url, params=None, *, max_age=MAX_AGE, tries=4, timeout=30.0,
+    validate=None, secret_params=(),
+) -> str:
+    """GET с кэшем; secret_params хешируются в ключе кэша и тексте ошибок."""
+    safe_params = dict(params or {})
+    for name in secret_params:
+        if name in safe_params:
+            digest = hashlib.sha256(str(safe_params[name]).encode()).hexdigest()
+            safe_params[name] = f"sha256:{digest}"
+    key = url + "?" + urlencode(sorted(safe_params.items()))
 
     cached = store.cache_get(key, max_age)
     if cached is not None:
@@ -35,18 +44,20 @@ def fetch_text(url, params=None, *, max_age=MAX_AGE, tries=4, timeout=30.0, vali
 
     error = None
     for attempt in range(tries):
+        response = None
         try:
             response = requests.get(
                 url, params=params, timeout=timeout, headers={"User-Agent": USER_AGENT}
             )
         except requests.RequestException as exc:
-            error = exc
+            # Исключения requests могут содержать URL со значением API-ключа.
+            error = type(exc).__name__
         else:
             if response.status_code not in RETRY_STATUS:
                 try:
                     response.raise_for_status()
-                except requests.HTTPError as exc:
-                    raise RuntimeError(f"{key}: HTTP {response.status_code}") from exc
+                except requests.HTTPError:
+                    raise RuntimeError(f"{key}: HTTP {response.status_code}") from None
                 try:
                     if validate:
                         validate(response.text)
@@ -60,7 +71,7 @@ def fetch_text(url, params=None, *, max_age=MAX_AGE, tries=4, timeout=30.0, vali
 
         if attempt < tries - 1:
             delay = min(0.5 * 2**attempt, 8.0)
-            if isinstance(error, str) and response.status_code == 429:
+            if response is not None and response.status_code == 429:
                 retry_after = response.headers.get("Retry-After", "")
                 if retry_after.isdecimal():
                     delay = min(max(delay, int(retry_after)), 30.0)

@@ -24,6 +24,11 @@ print("зависимости: есть")
 
 from src.pipeline import store
 
+if os.getenv("SHODAN_API_KEY"):
+    print("Shodan: API-ключ найден (доступность и тариф проверяются при поиске)")
+else:
+    print("Shodan: API-ключ не задан — режим --shodan недоступен")
+
 for title, path in (("результаты (out)", store.OUT_DIR), ("данные (data)", store.DATA_DIR)):
     try:
         path.mkdir(parents=True, exist_ok=True)

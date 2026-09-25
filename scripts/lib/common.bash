@@ -58,6 +58,8 @@ prompt_script_args() {
     PROMPTED_ARGS=()
     if [[ "${1:-country}" == ct ]]; then
         example="--ct, example.org, --max-addresses, 100"
+    elif [[ "${1:-country}" == shodan ]]; then
+        example="--shodan, nginx country:DE, --shodan-pages, 2"
     else
         example="DE, --max-addresses, 100 (или --asn, AS3333)"
     fi

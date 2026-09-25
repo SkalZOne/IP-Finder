@@ -1,4 +1,4 @@
-"""Источники discovery. Бесплатные, без ключей."""
+"""Источники discovery: RIPEstat, Cert Spotter и Shodan."""
 
 from ipaddress import ip_address, ip_network, summarize_address_range
 
@@ -7,6 +7,8 @@ from .fetch import fetch_json
 
 RIPESTAT = "https://stat.ripe.net/data"
 CERTSPOTTER = "https://api.certspotter.com/v1/issuances"
+SHODAN = "https://api.shodan.io/shodan/host/search"
+SHODAN_CACHE_AGE = 24 * 3600
 
 
 def to_networks(raw) -> list:
@@ -145,6 +147,61 @@ def _ct_page(payload, domain: str) -> None:
         for entry in payload
     ):
         raise ValueError("certspotter вернул некорректный список имён")
+
+
+def shodan_ips(query: str, api_key: str, max_pages: int = 1):
+    """Уникальные IP из страниц Shodan Search API, без хранения баннеров в памяти."""
+    query = query.strip()
+    if not query:
+        raise ValueError("нужен поисковый запрос Shodan")
+    if not api_key:
+        raise ValueError("нужен SHODAN_API_KEY")
+    if not 1 <= max_pages <= 10:
+        raise ValueError("--shodan-pages должен быть в диапазоне 1–10")
+
+    seen = set()
+    for page in range(1, max_pages + 1):
+        params = {
+            "key": api_key,
+            "query": query,
+            "page": page,
+            "fields": "ip_str",
+            "minify": "true",
+        }
+        payload = fetch_json(
+            SHODAN,
+            params,
+            validate=_shodan_matches,
+            max_age=SHODAN_CACHE_AGE,
+            secret_params=("key",),
+        )
+        matches = _shodan_matches(payload)
+        for match in matches:
+            raw = match.get("ip_str")
+            if not isinstance(raw, str):
+                continue
+            try:
+                ip = str(ip_address(raw))
+            except ValueError:
+                continue
+            if ip not in seen:
+                seen.add(ip)
+                yield ip
+        # По документации Shodan отдаёт не более 100 совпадений на страницу.
+        if len(matches) < 100:
+            break
+
+
+def _shodan_matches(payload) -> list:
+    if not isinstance(payload, dict) or not isinstance(payload.get("matches"), list):
+        raise ValueError("Shodan вернул некорректный ответ")
+    matches = payload["matches"]
+    if not all(
+        isinstance(match, dict) and isinstance(match.get("ip_str"), str)
+        for match in matches
+    ):
+        raise ValueError("Shodan вернул некорректные совпадения")
+    return matches
 
 
 def _country_resources(payload, code: str) -> dict:

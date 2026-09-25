@@ -39,9 +39,10 @@ run_choice() {
     fi
 
     file="${MENU[$choice]}"
-    if [[ "$(basename "$file")" == 40_run_country.sh || "$(basename "$file")" == 50_run_ct.sh ]]; then
+    if [[ "$(basename "$file")" == 40_run_country.sh || "$(basename "$file")" == 50_run_ct.sh || "$(basename "$file")" == 55_run_shodan.sh ]]; then
         kind=country
         [[ "$(basename "$file")" == 50_run_ct.sh ]] && kind=ct
+        [[ "$(basename "$file")" == 55_run_shodan.sh ]] && kind=shodan
         prompt_script_args "$kind" || return 1
         echo -e "\nЗапускаем $file..."
         IPFINDER_ARGS_PROMPTED=1 bash "$file" "${PROMPTED_ARGS[@]}"

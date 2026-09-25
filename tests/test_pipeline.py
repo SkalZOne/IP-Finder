@@ -632,8 +632,67 @@ class FetchCacheTests(TempStoreMixin, unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         self.assertIsNone(store.cache_get("http://example.invalid/json?", None))
 
+    def test_secret_param_is_absent_from_cache_and_errors(self) -> None:
+        token = "private-shodan-token"
+        with mock.patch("src.pipeline.fetch.requests.get", return_value=self.response(200, "{}")):
+            fetch.fetch_json("https://api.shodan.io/search", {"key": token, "query": "nginx"},
+                             secret_params=("key",))
+        cache_file = next((store.DATA_DIR / "cache").glob("*.json"))
+        self.assertNotIn(token, cache_file.read_text())
+
+        with mock.patch("src.pipeline.fetch.requests.get", side_effect=fetch.requests.Timeout(token)):
+            with mock.patch("src.pipeline.fetch.time.sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    fetch.fetch_text("https://api.shodan.io/search", {"key": token},
+                                     secret_params=("key",), tries=2)
+        self.assertNotIn(token, str(ctx.exception))
+
+        denied = self.response(401, "denied")
+        denied.raise_for_status.side_effect = fetch.requests.HTTPError(token)
+        with mock.patch("src.pipeline.fetch.requests.get", return_value=denied):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch.fetch_text("https://api.shodan.io/search", {"key": token},
+                                 secret_params=("key",), tries=1)
+        self.assertNotIn(token, str(ctx.exception))
+
+
+class ShodanTests(unittest.TestCase):
+    def test_pages_and_deduplicates_ips(self) -> None:
+        first = {"matches": [{"ip_str": "198.51.100.1"}] * 100, "total": 101}
+        second = {"matches": [{"ip_str": "198.51.100.2"}], "total": 101}
+        with mock.patch("src.pipeline.sources.fetch_json", side_effect=[first, second]) as get:
+            self.assertEqual(list(sources.shodan_ips(" nginx ", "secret", max_pages=3)),
+                             ["198.51.100.1", "198.51.100.2"])
+        self.assertEqual(get.call_args_list[0].args[1]["query"], "nginx")
+        self.assertEqual(get.call_args_list[1].args[1]["page"], 2)
+        self.assertEqual(get.call_args_list[0].kwargs["secret_params"], ("key",))
+
+    def test_bad_response_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            sources._shodan_matches({"error": "unauthorized"})
+        with self.assertRaises(ValueError):
+            sources._shodan_matches({"matches": [{"port": 443}]})
+
 
 class CliTests(TempStoreMixin, unittest.TestCase):
+    def test_shodan_output_and_limit(self) -> None:
+        with mock.patch.dict("os.environ", {"SHODAN_API_KEY": "test-key"}):
+            with mock.patch("src.main.sources.shodan_ips", return_value=iter(
+                ["198.51.100.1", "198.51.100.2", "198.51.100.3"]
+            )) as search:
+                with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                    self.assertEqual(main.main(["--shodan", "nginx country:DE",
+                                                "--max-addresses", "2"]), 0)
+        self.assertEqual(search.call_args.args, ("nginx country:DE", "test-key"))
+        output = next(store.OUT_DIR.glob("shodan_*.txt"))
+        self.assertEqual(output.read_text().splitlines(), ["198.51.100.1", "198.51.100.2"])
+
+    def test_shodan_needs_api_key_before_writing(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch("sys.stderr"):
+                self.assertEqual(main.main(["--shodan", "nginx"]), 1)
+        self.assertFalse(store.OUT_DIR.exists())
+
     def test_asn_output_and_resume(self) -> None:
         networks = [ipaddress.ip_network("198.51.100.0/29")]
         with mock.patch("src.main.sources.asn", return_value=networks):

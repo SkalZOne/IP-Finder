@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Поиск IP по стране, AS или домену; результат — текстовый файл.
+"""Поиск IP по стране, AS, домену или Shodan; результат — текстовый файл.
 
     python -m src.main LI                     страна -> префиксы -> IP
     python -m src.main DE --no-ipv6
     python -m src.main --asn AS3333            ASN -> анонсированные префиксы -> IP
     python -m src.main --ct example.org       домен -> CT -> имена -> DNS -> IP
+    python -m src.main --shodan 'nginx country:DE'
 
 Запускать из корня проекта и только как модуль: файл импортирует
 `src.pipeline`, то есть ожидает в sys.path корень проекта.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -175,11 +177,61 @@ def run_ct(args) -> int:
     return 0
 
 
+def run_shodan(args) -> int:
+    query = args.shodan.strip()
+    api_key = os.getenv("SHODAN_API_KEY", "").strip()
+    if not api_key:
+        print("нужен SHODAN_API_KEY в окружении или .env", file=sys.stderr)
+        return 1
+
+    stream = normalize.take(
+        sources.shodan_ips(query, api_key, max_pages=args.shodan_pages),
+        args.max_addresses or None,
+    )
+    preview: list[str] = []
+    total = 0
+    path = None
+    opened = False
+    try:
+        if args.no_save:
+            for ip in stream:
+                total += 1
+                if len(preview) < args.limit:
+                    preview.append(ip)
+            saved = 0
+        else:
+            path = store.output_path("shodan", args.out)
+            check_output(path, args)
+            with store.Output(path, append=args.append) as out:
+                opened = True
+                for ip in stream:
+                    total += 1
+                    if len(preview) < args.limit:
+                        preview.append(ip)
+                    out.write(ip)
+            saved = out.count
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"поиск Shodan не выполнен: {exc}", file=sys.stderr)
+        if opened:
+            print(f"# частичный файл: {path}", file=sys.stderr)
+        return 1
+
+    print(f"# Shodan: запрос {query!r}, уникальных адресов {total}, записано {saved}", file=sys.stderr)
+    if path is not None:
+        print(f"# файл: {path}", file=sys.stderr)
+    for ip in preview:
+        print(ip)
+    if total > len(preview):
+        print(f"# ...и ещё {total - len(preview):,} (см. --limit)", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("country", nargs="?", help="код страны из двух букв, например LI")
     parser.add_argument("--ct", metavar="ДОМЕН", help="раскрыть домен через CT-логи")
     parser.add_argument("--asn", metavar="AS123", help="анонсированные сети автономной системы")
+    parser.add_argument("--shodan", metavar="ЗАПРОС", help="найти IP через Shodan Search API")
     parser.add_argument(
         "--per-prefix", type=int, default=0, help="адресов из каждой сети; 0 = все IPv4"
     )
@@ -204,17 +256,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="разрешить замену существующего --out")
     parser.add_argument("--workers", type=int, default=8, help="параллельных DNS-запросов для CT (1–32)")
     parser.add_argument("--ct-pages", type=int, default=1, help="страниц Cert Spotter для CT (1–10)")
+    parser.add_argument("--shodan-pages", type=int, default=1, help="страниц Shodan (1–10)")
     parser.add_argument("--include-ipv6", action="store_true", help="искать также AAAA-записи в CT-режиме")
     parser.add_argument("--no-cache", action="store_true", help="не читать и не писать кэш ответов")
     args = parser.parse_args(argv)
 
-    if sum(bool(value) for value in (args.country, args.ct, args.asn)) != 1:
-        parser.error("укажите ровно одну цель: код страны, --ct ДОМЕН или --asn AS123")
-    if args.country and (
+    if sum(value is not None for value in (args.country, args.ct, args.asn, args.shodan)) != 1:
+        parser.error("укажите ровно одну цель: страну, --asn, --ct или --shodan")
+    if args.shodan is not None and not args.shodan.strip():
+        parser.error("--shodan требует непустой запрос")
+    if args.country is not None and (
         len(args.country) != 2 or not args.country.isascii() or not args.country.isalpha()
     ):
         parser.error("код страны должен состоять из двух латинских букв")
-    if args.asn:
+    if args.ct is not None and not args.ct.strip():
+        parser.error("--ct требует непустой домен")
+    if args.asn is not None:
         number = args.asn.upper().removeprefix("AS")
         if not number.isascii() or not number.isdecimal() or int(number) < 1:
             parser.error("ASN должен иметь вид AS123 или 123")
@@ -225,10 +282,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--workers должен быть в диапазоне 1–32")
     if not 1 <= args.ct_pages <= 10:
         parser.error("--ct-pages должен быть в диапазоне 1–10")
-    if args.ct and (args.per_prefix or args.no_ipv6 or args.restart):
+    if not 1 <= args.shodan_pages <= 10:
+        parser.error("--shodan-pages должен быть в диапазоне 1–10")
+    if (args.ct or args.shodan) and (args.per_prefix or args.no_ipv6 or args.restart):
         parser.error("--per-prefix, --no-ipv6 и --restart применимы только к сетям")
     if not args.ct and (args.workers != 8 or args.ct_pages != 1 or args.include_ipv6):
         parser.error("--workers, --ct-pages и --include-ipv6 применимы только к CT-режиму")
+    if not args.shodan and args.shodan_pages != 1:
+        parser.error("--shodan-pages применим только к Shodan-режиму")
     if args.no_save and (args.out or args.append or args.force):
         parser.error("--no-save нельзя сочетать с --out, --append или --force")
     if args.append and (not args.out or args.force):
@@ -237,9 +298,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--force требует --out")
 
     store.CACHE_ENABLED = not args.no_cache
-    if args.ct:
+    if args.ct is not None:
         return run_ct(args)
-    if args.asn:
+    if args.shodan is not None:
+        return run_shodan(args)
+    if args.asn is not None:
         return run_networks(args, kind="asn", resource=args.asn)
     return run_networks(args, kind="country", resource=args.country)
 

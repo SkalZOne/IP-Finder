@@ -23,15 +23,15 @@ class MenuTests(unittest.TestCase):
 
     def test_menu_prompts_before_each_search(self) -> None:
         result = subprocess.run(
-            ["./init.sh", "3", "4"],
-            input="--help\n0\n--help\n0\n",
+            ["./init.sh", "3", "4", "5"],
+            input="--help\n0\n--help\n0\n--help\n0\n",
             text=True,
             capture_output=True,
             cwd=ROOT,
             check=True,
         )
-        self.assertEqual(result.stdout.count("usage: python -m src.main"), 2)
-        self.assertEqual(result.stdout.count("Запускаем "), 2)
+        self.assertEqual(result.stdout.count("usage: python -m src.main"), 3)
+        self.assertEqual(result.stdout.count("Запускаем "), 3)
 
     def test_eof_does_not_start_search(self) -> None:
         result = subprocess.run(
