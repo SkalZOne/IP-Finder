@@ -1,6 +1,6 @@
 #!/bin/bash
 # ORDER: 40
-# DESC: Поиск по стране (LI, DE, ...), аргументы пробрасываются в src.main
+# DESC: Найти IP-адреса по коду страны
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.bash"
 require_deps
 

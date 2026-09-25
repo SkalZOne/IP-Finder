@@ -1,6 +1,6 @@
 #!/bin/bash
 # ORDER: 50
-# DESC: Поиск по домену через CT-логи (--ct example.org)
+# DESC: Найти IP-адреса домена через CT-журналы
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.bash"
 require_deps
 

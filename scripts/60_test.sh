@@ -1,6 +1,6 @@
 #!/bin/bash
 # ORDER: 60
-# DESC: Прогнать тесты (база не нужна, всё работает на файлах)
+# DESC: Запустить тесты
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.bash"
 require_venv
 
