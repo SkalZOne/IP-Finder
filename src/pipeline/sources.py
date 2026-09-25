@@ -15,7 +15,9 @@ def to_networks(raw) -> list:
     Реестр отдаёт ресурсы в обеих формах, поэтому диапазонная ветка здесь
     не «на всякий случай».
     """
-    raw = (raw or "").strip()
+    if not isinstance(raw, str):
+        return []
+    raw = raw.strip()
     if not raw:
         return []
 
@@ -23,7 +25,7 @@ def to_networks(raw) -> list:
         low, _, high = raw.partition("-")
         try:
             first, last = ip_address(low.strip()), ip_address(high.strip())
-        except ValueError:
+        except (TypeError, ValueError):
             return []
         # На разных версиях summarize_address_range бросает TypeError, не ValueError.
         if first.version != last.version:
@@ -42,11 +44,15 @@ def to_networks(raw) -> list:
 def country(code: str):
     """Префиксы и номера AS страны -> (networks, asns)."""
     code = code.strip().upper()
-    if len(code) != 2 or not code.isalpha():
+    if len(code) != 2 or not code.isascii() or not code.isalpha():
         raise ValueError(f"нужен код страны из двух букв, получено {code!r}")
 
-    payload = fetch_json(f"{RIPESTAT}/country-resource-list/data.json", {"resource": code})
-    resources = _data(payload, code).get("resources") or {}
+    payload = fetch_json(
+        f"{RIPESTAT}/country-resource-list/data.json",
+        {"resource": code},
+        validate=lambda value: _country_resources(value, code),
+    )
+    resources = _country_resources(payload, code)
 
     networks = []
     for family in ("ipv4", "ipv6"):
@@ -61,41 +67,101 @@ def country(code: str):
 def asn(number: int) -> list:
     """Анонсированные префиксы автономной системы."""
     resource = f"AS{int(number)}"
-    payload = fetch_json(f"{RIPESTAT}/announced-prefixes/data.json", {"resource": resource})
+    payload = fetch_json(
+        f"{RIPESTAT}/announced-prefixes/data.json",
+        {"resource": resource},
+        validate=lambda value: _asn_prefixes(value, resource),
+    )
 
     networks = []
-    for entry in _data(payload, resource).get("prefixes") or []:
+    for entry in _asn_prefixes(payload, resource):
         raw = entry.get("prefix") if isinstance(entry, dict) else entry
         networks += to_networks(raw)
     return networks
 
 
-def ct_names(domain: str) -> list[str]:
-    """Имена из сертификатов домена, включая поддомены.
-
-    Без ключа certspotter даёт 10 запросов на окно, поэтому это точечный
-    инструмент, а не массовый. crt.sh как альтернатива сейчас лежит.
-    """
+def ct_names(domain: str, max_pages: int = 1) -> list[str]:
+    """Имена из сертификатов домена, включая поддомены и до max_pages страниц."""
     domain = domain.strip().lower().rstrip(".")
-    if not domain:
-        raise ValueError("нужен домен")
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("некорректный домен") from exc
+    labels = domain.split(".")
+    if (
+        not 1 <= max_pages <= 10
+        or not domain
+        or len(domain) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or label[0] == "-"
+            or label[-1] == "-"
+            or not all(c.isascii() and (c.isalnum() or c == "-") for c in label)
+            for label in labels
+        )
+    ):
+        raise ValueError("некорректный домен или --ct-pages")
 
-    payload = fetch_json(
-        CERTSPOTTER,
-        {"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
-    )
+    params = {"domain": domain, "include_subdomains": "true", "expand": "dns_names"}
+    names = set()
+    after = None
+    for page_index in range(max_pages):
+        if after is not None:
+            params["after"] = after
+        payload = fetch_json(
+            CERTSPOTTER,
+            params.copy(),
+            validate=lambda value: _ct_page(value, domain),
+        )
+        _ct_page(payload, domain)
+        if not payload:
+            break
+        for issuance in payload:
+            for raw in issuance.get("dns_names") or []:
+                if not isinstance(raw, str):
+                    continue
+                name = raw.strip().lower().rstrip(".")
+                # Дикая карточка не резолвится, а чужие домены из SAN нам не нужны.
+                if name and not name.startswith("*."):
+                    if name == domain or name.endswith("." + domain):
+                        names.add(name)
+        new_after = payload[-1].get("id")
+        if page_index < max_pages - 1 and new_after is None:
+            raise ValueError("certspotter не вернул id для следующей страницы")
+        if new_after is not None and new_after == after:
+            raise ValueError("certspotter повторил страницу")
+        after = new_after
+    return sorted(names)
+
+
+def _ct_page(payload, domain: str) -> None:
     if not isinstance(payload, list):
         raise ValueError(f"certspotter вернул не список для {domain}")
+    if not all(isinstance(entry, dict) for entry in payload):
+        raise ValueError("certspotter вернул некорректную запись")
+    if not all(
+        entry.get("dns_names") is None or isinstance(entry.get("dns_names"), list)
+        for entry in payload
+    ):
+        raise ValueError("certspotter вернул некорректный список имён")
 
-    names = set()
-    for issuance in payload:
-        for raw in issuance.get("dns_names") or []:
-            name = raw.strip().lower().rstrip(".")
-            # Дикая карточка не резолвится, а чужие домены из SAN нам не нужны.
-            if name and not name.startswith("*."):
-                if name == domain or name.endswith("." + domain):
-                    names.add(name)
-    return sorted(names)
+
+def _country_resources(payload, code: str) -> dict:
+    resources = _data(payload, code).get("resources")
+    if not isinstance(resources, dict) or any(
+        resources.get(key) is not None and not isinstance(resources.get(key), list)
+        for key in ("ipv4", "ipv6", "asn")
+    ):
+        raise ValueError(f"RIPEstat вернул некорректные ресурсы для {code}")
+    return resources
+
+
+def _asn_prefixes(payload, resource: str) -> list:
+    prefixes = _data(payload, resource).get("prefixes")
+    if not isinstance(prefixes, list):
+        raise ValueError(f"RIPEstat вернул некорректные префиксы для {resource}")
+    return prefixes
 
 
 def _data(payload, what: str) -> dict:

@@ -1,8 +1,13 @@
 #!/bin/bash
 # ORDER: 40
-# DESC: Найти IP-адреса по коду страны
+# DESC: Найти IP-адреса по стране или ASN
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.bash"
 require_deps
+
+if [[ $# -eq 0 && -t 0 && "${IPFINDER_ARGS_PROMPTED:-0}" != 1 ]]; then
+    prompt_script_args country || exit 1
+    set -- "${PROMPTED_ARGS[@]}"
+fi
 
 if [[ $# -eq 0 ]]; then
     note "аргументов нет — пробный прогон по Лихтенштейну, без записи в файл"

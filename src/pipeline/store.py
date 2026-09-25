@@ -18,6 +18,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -105,7 +106,7 @@ def output_path(route: str, explicit: str | None = None) -> Path:
     """Куда писать результат: --out, либо out/<маршрут>_<дата-время>.txt."""
     if explicit:
         return Path(explicit).expanduser()
-    return OUT_DIR / f"{route}_{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    return OUT_DIR / f"{route}_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.txt"
 
 
 class Output:

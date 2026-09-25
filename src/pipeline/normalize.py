@@ -2,7 +2,9 @@
 
 import itertools
 import socket
-from ipaddress import ip_address
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from ipaddress import IPv4Address, IPv6Address, ip_address
 
 
 PER_PREFIX = 32
@@ -61,28 +63,24 @@ def iter_from(networks, cursor: str | None = None, per_prefix: int = 0):
         if start_order and (network.version, int(network.broadcast_address)) <= start_order:
             continue
 
-        hosts = network.hosts()
-        first = next(hosts, None)
-        if first is None:
-            continue
-
-        stream = itertools.chain([first], hosts)
-        skip = 0
-
-        if start is not None and start in network:
-            skip = max(0, int(start) + 1 - int(first))
-            if skip:
-                stream = itertools.islice(stream, skip, None)
-
+        first = int(network.network_address)
+        last = int(network.broadcast_address)
+        # IPv4 /31 и /32 включают все адреса, остальные сети исключают
+        # адрес сети и broadcast. Для IPv6 hosts() исключает только первый.
+        if (network.version == 6 and network.prefixlen < 127) or (
+            network.version == 4 and network.prefixlen < 31
+        ):
+            first += 1
+        if network.version == 4 and network.prefixlen < 31:
+            last -= 1
         limit = _limit(network, per_prefix)
         if limit > 0:
-            limit -= skip  # выборка считается от начала сети
-            if limit <= 0:
-                continue
-            stream = itertools.islice(stream, limit)
-
-        for ip in stream:
-            yield str(ip)
+            last = min(last, first + limit - 1)
+        if start and start.version == network.version:
+            first = max(first, int(start) + 1)
+        address_type = IPv4Address if network.version == 4 else IPv6Address
+        for value in range(first, last + 1):
+            yield str(address_type(value))
 
 
 def take(ips, limit: int | None):
@@ -99,12 +97,31 @@ def iter_ips(hits, per_prefix: int = 0):
             yield str(hit["ip"])
 
 
-def resolve_name(name: str) -> list[str]:
+def resolve_name(name: str, include_ipv6: bool = False) -> list[str]:
     try:
-        infos = socket.getaddrinfo(name, None, socket.AF_INET)
-    except socket.gaierror:
+        family = socket.AF_UNSPEC if include_ipv6 else socket.AF_INET
+        infos = socket.getaddrinfo(name, None, family)
+    except OSError:
         return []
     return sorted({info[4][0] for info in infos}, key=_sort_key)
+
+
+def iter_resolved(names, workers: int = 8, include_ipv6: bool = False):
+    """Разрешает имена параллельно, удерживая не больше workers задач в памяти."""
+    if workers < 1:
+        raise ValueError("workers должен быть положительным")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        for name in names:
+            pending.append((name, pool.submit(resolve_name, name, include_ipv6)))
+            if len(pending) >= workers:
+                ready_name, future = pending.popleft()
+                for ip in future.result():
+                    yield ip, ready_name
+        while pending:
+            ready_name, future = pending.popleft()
+            for ip in future.result():
+                yield ip, ready_name
 
 
 def _sort_key(text: str):

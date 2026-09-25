@@ -50,3 +50,29 @@ require_project_root() {
 }
 
 require_project_root
+
+# Собирает аргументы по одному, сохраняя пробелы в значениях (например, в --out).
+# Отдельная строка 0 завершает ввод и не добавляется к команде.
+prompt_script_args() {
+    local argument example
+    PROMPTED_ARGS=()
+    if [[ "${1:-country}" == ct ]]; then
+        example="--ct, example.org, --max-addresses, 100"
+    else
+        example="DE, --max-addresses, 100 (или --asn, AS3333)"
+    fi
+    note "Введите аргументы по одному. Например: $example."
+    note "Для значения --out укажите путь отдельной строкой. 0 — закончить без добавления аргумента."
+    while true; do
+        if ! read -r -p "Аргумент $((${#PROMPTED_ARGS[@]} + 1)) (0 — закончить): " argument; then
+            warn "ввод аргументов прерван"
+            return 1
+        fi
+        [[ "$argument" == 0 ]] && break
+        if [[ -z "$argument" ]]; then
+            warn "пустой аргумент пропущен; введите 0, чтобы закончить"
+            continue
+        fi
+        PROMPTED_ARGS+=("$argument")
+    done
+}

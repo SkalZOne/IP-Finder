@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from src import main
 from src.pipeline import fetch, normalize, sources, store
 
 
@@ -70,6 +71,14 @@ class SourcePayloadTests(unittest.TestCase):
     def test_ok_passes_through(self) -> None:
         self.assertEqual(sources._data({"status": "ok", "data": {"x": 1}}, "AS1"), {"x": 1})
 
+    def test_malformed_country_resources_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            sources._country_resources({"status": "ok", "data": {"resources": []}}, "LI")
+
+    def test_malformed_asn_prefixes_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            sources._asn_prefixes({"status": "ok", "data": {"prefixes": {}}}, "AS1")
+
 
 class CtNamesTests(unittest.TestCase):
     """Разбор ответа certspotter. Форма снята с живого API."""
@@ -121,6 +130,28 @@ class CtNamesTests(unittest.TestCase):
     def test_non_list_payload_rejected(self) -> None:
         with self.assertRaises(ValueError):
             self.names({"error": "rate limited"})
+
+    def test_malformed_dns_names_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.names([{"id": "1", "dns_names": "bad.example.org"}])
+
+    def test_reads_next_page_using_last_id(self) -> None:
+        pages = [
+            [{"id": "11", "dns_names": ["a.example.org"]}],
+            [{"id": "12", "dns_names": ["b.example.org"]}],
+            [],
+        ]
+        with mock.patch("src.pipeline.sources.fetch_json", side_effect=pages) as get:
+            names = sources.ct_names("example.org", max_pages=3)
+        self.assertEqual(names, ["a.example.org", "b.example.org"])
+        self.assertEqual(get.call_args_list[1].args[1]["after"], "11")
+        self.assertEqual(get.call_args_list[2].args[1]["after"], "12")
+
+    def test_invalid_domain_is_rejected_before_request(self) -> None:
+        with mock.patch("src.pipeline.sources.fetch_json") as get:
+            with self.assertRaises(ValueError):
+                sources.ct_names("bad..example.org")
+        get.assert_not_called()
 
 
 class NormalizeTests(unittest.TestCase):
@@ -269,6 +300,37 @@ class ResumeTests(unittest.TestCase):
     def test_ipv6_cap_applies_when_resuming_too(self) -> None:
         ips = list(normalize.iter_from(self.nets("2001:db8::/32"), per_prefix=0))
         self.assertEqual(len(ips), normalize.MAX_IPV6_PER_PREFIX)
+
+    def test_resume_deep_inside_huge_network_is_immediate(self) -> None:
+        with mock.patch.object(ipaddress.IPv4Network, "hosts", side_effect=AssertionError("slow scan")):
+            stream = normalize.iter_from(self.nets("10.0.0.0/8"), "10.200.0.0")
+            self.assertEqual(next(stream), "10.200.0.1")
+
+    def test_ipv6_127_and_128_include_all_hosts(self) -> None:
+        self.assertEqual(list(normalize.iter_from(self.nets("2001:db8::/127"))),
+                         ["2001:db8::", "2001:db8::1"])
+        self.assertEqual(list(normalize.iter_from(self.nets("2001:db8::5/128"))),
+                         ["2001:db8::5"])
+
+
+class ResolveTests(unittest.TestCase):
+    def test_parallel_resolution_keeps_name_order(self) -> None:
+        with mock.patch("src.pipeline.normalize.resolve_name", side_effect=lambda name, include_ipv6: [
+            "10.0.0.1" if name == "a.example.org" else "10.0.0.2"
+        ]):
+            rows = list(normalize.iter_resolved(["a.example.org", "b.example.org"], workers=2))
+        self.assertEqual(rows, [("10.0.0.1", "a.example.org"),
+                                ("10.0.0.2", "b.example.org")])
+
+    def test_ipv6_dns_is_opt_in(self) -> None:
+        answers = [
+            (socket.AF_INET6, 0, 0, "", ("2001:db8::1", 0, 0, 0)),
+            (socket.AF_INET, 0, 0, "", ("198.51.100.1", 0)),
+        ]
+        with mock.patch("socket.getaddrinfo", return_value=answers) as get:
+            self.assertEqual(normalize.resolve_name("example.org", include_ipv6=True),
+                             ["198.51.100.1", "2001:db8::1"])
+        self.assertEqual(get.call_args.args[2], socket.AF_UNSPEC)
 
 
 class MergeTests(unittest.TestCase):
@@ -543,6 +605,88 @@ class FetchCacheTests(TempStoreMixin, unittest.TestCase):
 
         self.assertEqual(get.call_count, 2)
         self.assertIsNone(store.cache_get("http://example.invalid/x?", None))
+
+    def test_invalid_json_is_retried_and_not_cached(self) -> None:
+        replies = [self.response(200, "not json"), self.response(200, '{"ok": true}')]
+        with mock.patch("src.pipeline.fetch.requests.get", side_effect=replies) as get:
+            with mock.patch("src.pipeline.fetch.time.sleep"):
+                self.assertEqual(fetch.fetch_json("http://example.invalid/json", tries=2), {"ok": True})
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(store.cache_get("http://example.invalid/json?", None), '{"ok": true}')
+
+    def test_corrupt_cached_json_is_refetched(self) -> None:
+        store.cache_put("http://example.invalid/json?", "broken")
+        with mock.patch("src.pipeline.fetch.requests.get", return_value=self.response(200, "[]")):
+            self.assertEqual(fetch.fetch_json("http://example.invalid/json"), [])
+
+    def test_api_error_inside_http_200_is_not_cached(self) -> None:
+        bad = self.response(200, '{"status": "error", "data": {}}')
+        with mock.patch("src.pipeline.fetch.requests.get", return_value=bad) as get:
+            with mock.patch("src.pipeline.fetch.time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    fetch.fetch_json(
+                        "http://example.invalid/json",
+                        validate=lambda payload: sources._data(payload, "LI"),
+                        tries=2,
+                    )
+        self.assertEqual(get.call_count, 2)
+        self.assertIsNone(store.cache_get("http://example.invalid/json?", None))
+
+
+class CliTests(TempStoreMixin, unittest.TestCase):
+    def test_asn_output_and_resume(self) -> None:
+        networks = [ipaddress.ip_network("198.51.100.0/29")]
+        with mock.patch("src.main.sources.asn", return_value=networks):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(main.main(["--asn", "AS64500", "--no-ipv6", "--max-addresses", "2"]), 0)
+                self.assertEqual(main.main(["--asn", "AS64500", "--no-ipv6", "--max-addresses", "2"]), 0)
+        outputs = sorted(store.OUT_DIR.glob("asn_*.txt"))
+        self.assertEqual([path.read_text().splitlines() for path in outputs],
+                         [["198.51.100.1", "198.51.100.2"],
+                          ["198.51.100.3", "198.51.100.4"]])
+
+    def test_existing_output_is_preserved(self) -> None:
+        path = store.OUT_DIR / "saved.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("important\n")
+        with mock.patch("src.main.sources.country", return_value=(
+            [ipaddress.ip_network("198.51.100.0/30")], []
+        )):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(main.main(["LI", "--out", str(path)]), 1)
+        self.assertEqual(path.read_text(), "important\n")
+
+    def test_force_replaces_existing_output(self) -> None:
+        path = store.OUT_DIR / "saved.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("old\n")
+        with mock.patch("src.main.sources.country", return_value=(
+            [ipaddress.ip_network("198.51.100.0/30")], []
+        )):
+            with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                self.assertEqual(main.main(["LI", "--out", str(path), "--force"]), 0)
+        self.assertEqual(path.read_text().splitlines(), ["198.51.100.1", "198.51.100.2"])
+
+    def test_changed_selection_uses_new_cursor(self) -> None:
+        networks = [ipaddress.ip_network("198.51.100.0/29")]
+        with mock.patch("src.main.sources.country", return_value=(networks, [])):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(main.main(["LI", "--per-prefix", "2"]), 0)
+                self.assertEqual(main.main(["LI", "--per-prefix", "3"]), 0)
+        outputs = sorted(store.OUT_DIR.glob("country_*.txt"))
+        self.assertEqual(outputs[1].read_text().splitlines(),
+                         ["198.51.100.1", "198.51.100.2", "198.51.100.3"])
+
+    def test_changed_network_snapshot_uses_new_cursor(self) -> None:
+        first = [ipaddress.ip_network("198.51.100.0/30")]
+        second = [ipaddress.ip_network("198.51.100.0/29")]
+        with mock.patch("src.main.sources.country", side_effect=[(first, []), (second, [])]):
+            with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                self.assertEqual(main.main(["LI", "--max-addresses", "1"]), 0)
+                self.assertEqual(main.main(["LI", "--max-addresses", "1"]), 0)
+        outputs = sorted(store.OUT_DIR.glob("country_*.txt"))
+        self.assertEqual([path.read_text().strip() for path in outputs],
+                         ["198.51.100.1", "198.51.100.1"])
 
 
 if __name__ == "__main__":
