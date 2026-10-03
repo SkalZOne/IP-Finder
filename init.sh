@@ -4,7 +4,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/scripts/lib/common.bash"
 WHITE='\033[0;37m'
 BOLD_GREEN='\033[1;32m'
 
-SCRIPTS_DIR="$PROJECT_ROOT/scripts"
+SCRIPTS_DIR="./scripts"
 
 declare -A SCRIPT_LIST
 declare -A SCRIPT_DESC

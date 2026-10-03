@@ -97,23 +97,30 @@ def iter_ips(hits, per_prefix: int = 0):
             yield str(hit["ip"])
 
 
-def resolve_name(name: str, include_ipv6: bool = False) -> list[str]:
+def resolve_name(name: str) -> list[str]:
     try:
-        family = socket.AF_UNSPEC if include_ipv6 else socket.AF_INET
-        infos = socket.getaddrinfo(name, None, family)
+        infos = socket.getaddrinfo(name, None, socket.AF_INET)
     except OSError:
         return []
-    return sorted({info[4][0] for info in infos}, key=_sort_key)
+    addresses = {info[4][0] for info in infos if is_ipv4(info[4][0])}
+    return sorted(addresses, key=_sort_key)
 
 
-def iter_resolved(names, workers: int = 8, include_ipv6: bool = False):
+def is_ipv4(value: str) -> bool:
+    try:
+        return ip_address(value).version == 4
+    except ValueError:
+        return False
+
+
+def iter_resolved(names, workers: int = 8):
     """Разрешает имена параллельно, удерживая не больше workers задач в памяти."""
     if workers < 1:
         raise ValueError("workers должен быть положительным")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque()
         for name in names:
-            pending.append((name, pool.submit(resolve_name, name, include_ipv6)))
+            pending.append((name, pool.submit(resolve_name, name)))
             if len(pending) >= workers:
                 ready_name, future = pending.popleft()
                 for ip in future.result():

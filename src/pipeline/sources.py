@@ -181,9 +181,12 @@ def shodan_ips(query: str, api_key: str, max_pages: int = 1):
             if not isinstance(raw, str):
                 continue
             try:
-                ip = str(ip_address(raw))
+                address = ip_address(raw)
             except ValueError:
                 continue
+            if address.version != 4:
+                continue
+            ip = str(address)
             if ip not in seen:
                 seen.add(ip)
                 yield ip

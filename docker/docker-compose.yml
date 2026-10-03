@@ -3,7 +3,7 @@ services:
   app:
     build: 
       context: ..
-      dockerfile: docker/dockerfile
+      dockerfile: docker/Dockerfile
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONIOENCODING=UTF-8

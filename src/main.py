@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Поиск IP по стране, AS, домену или Shodan; результат — текстовый файл.
+"""IP-адреса из открытых источников: HTTP-сервис и CLI.
+
+HTTP-сервис (`uvicorn src.main:app`): POST /rep с телом {"country": "DE"}
+возвращает IPv4-адреса страны в JSON; без поля count отдаются все адреса
+(тело собирается потоково, поэтому размер ответа память не ограничивает).
+
+CLI: страна, AS, домен или Shodan; результат — текстовый файл.
 
     python -m src.main LI                     страна -> префиксы -> IP
-    python -m src.main DE --no-ipv6
+    python -m src.main DE --per-prefix 10
     python -m src.main --asn AS3333            ASN -> анонсированные префиксы -> IP
     python -m src.main --ct example.org       домен -> CT -> имена -> DNS -> IP
     python -m src.main --shodan 'nginx country:DE'
@@ -21,291 +27,91 @@ out/<маршрут>_<дата-время>.txt; своё задаётся чер
 
 from __future__ import annotations
 
-import argparse
-import hashlib
-import os
-import sys
-from pathlib import Path
+import itertools
+import json
 
-from src.pipeline import normalize, sources, store
+from src.pipeline import normalize, sources
 
-
-PREVIEW_LIMIT = 200
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 
-def run_networks(args, *, kind: str, resource: str) -> int:
+class REPRequest(BaseModel):
+    # Лишние поля — ошибка: опечатка в имени лимита не должна молча означать
+    # «отдай все адреса страны».
+    model_config = ConfigDict(extra="forbid")
+
+    country: str = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        pattern=r"^[A-Za-z]{2}$",
+        description="Код страны из двух латинских букв, например DE",
+    )
+    count: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Сколько IPv4-адресов вернуть. Поле не задано — возвращаются все "
+            "адреса страны; truncated=true означает, что список обрезан"
+        ),
+    )
+
+class REPResponse(BaseModel):
+    country: str
+    count: int
+    truncated: bool
+    addresses: list[str]
+
+app = FastAPI()
+
+
+@app.post("/rep", response_model=REPResponse)
+def rep(request: REPRequest) -> StreamingResponse:
+    """IPv4-адреса страны: до count штук, а без count — все."""
+    # Синхронный обработчик намеренно: sources.country ходит в RIPEstat через
+    # requests, и в async-функции этот вызов заблокировал бы цикл событий.
+    # FastAPI выполняет def-обработчики в пуле потоков.
+    country = request.country.upper()
     try:
-        if kind == "country":
-            networks, asns = sources.country(resource)
-        else:
-            networks, asns = sources.asn(int(resource[2:])), [int(resource[2:])]
+        networks, _ = sources.country(country)
     except (ValueError, RuntimeError, OSError) as exc:
-        print(f"источник не ответил: {exc}", file=sys.stderr)
-        return 1
+        raise HTTPException(status_code=502, detail=f"источник не ответил: {exc}") from exc
 
-    if args.no_ipv6:
-        networks = [n for n in networks if n.version == 4]
+    # Вложенные сети дали бы повторы, поэтому merge оставляет только внешние.
+    ipv4 = normalize.merge([n for n in networks if n.version == 4])
 
-    # Сети реестра пересекаются между собой; слияние заменяет дедупликацию,
-    # которую раньше делала база, и по памяти не стоит ничего.
-    networks = normalize.merge(networks)
+    # Точный размер известен заранее: пересечений после merge нет.
+    total = sum(_addresses_in(network) for network in ipv4)
+    count = total if request.count is None else min(request.count, total)
+    truncated = request.count is not None and total > request.count
 
-    label = resource.upper()
-    # Курсор привязан к настройкам и снимку сетей: изменение источника
-    # не должно незаметно пропускать новые префиксы.
-    digest = hashlib.blake2s(
-        "\n".join(str(network) for network in networks).encode(), digest_size=8
-    ).hexdigest()
-    cursor = f"{kind}:{label}:p{args.per_prefix}:v{'4' if args.no_ipv6 else '46'}:{digest}"
-    resume = None if (args.restart or args.no_save) else store.get_cursor(cursor)
-
-    stream = normalize.take(
-        normalize.iter_from(networks, resume, args.per_prefix), args.max_addresses or None
-    )
-
-    preview: list[str] = []
-    total = 0
-
-    def seen():
-        nonlocal total
+    def body():
+        """JSON собирается порциями: адресов в стране могут быть десятки
+        миллионов, и готовый список в памяти не поместился бы."""
+        yield (
+            f'{{"country":{json.dumps(country)},"count":{count},'
+            f'"truncated":{"true" if truncated else "false"},"addresses":['
+        )
+        stream = normalize.iter_from(ipv4, per_prefix=0)
+        if count < total:
+            stream = itertools.islice(stream, count)
+        batch: list[str] = []
+        separator = ""
         for ip in stream:
-            total += 1
-            if len(preview) < args.limit:
-                preview.append(ip)
-            yield ip
+            batch.append(f'"{ip}"')
+            if len(batch) >= 4096:
+                yield separator + ",".join(batch)
+                separator = ","
+                batch.clear()
+        yield separator + ",".join(batch) + "]}"
 
-    path = None
-    try:
-        if args.no_save:
-            for _ in seen():
-                pass
-            saved = 0
-        else:
-            path = store.output_path(kind, args.out)
-            check_output(path, args)
-            with store.Output(
-                path,
-                append=args.append,
-                on_flush=lambda last: store.set_cursor(cursor, last),
-            ) as out:
-                for ip in seen():
-                    out.write(ip)
-            saved = out.count
-    except (OSError, ValueError) as exc:
-        print(f"ошибка записи: {exc}", file=sys.stderr)
-        return 1
-
-    v4 = sum(1 for n in networks if n.version == 4)
-    available = sum(n.num_addresses for n in networks if n.version == 4)
-
-    print(
-        f"# {label}: сетей {len(networks)} (IPv4 {v4}, IPv6 {len(networks) - v4}), AS {len(asns)}",
-        file=sys.stderr,
-    )
-    print(f"# в них IPv4-адресов {available:,}", file=sys.stderr)
-    if resume:
-        print(f"# продолжаем с {resume}", file=sys.stderr)
-    print(
-        f"# отдано {total:,} (per-prefix {args.per_prefix or 'все'}), записано {saved:,}",
-        file=sys.stderr,
-    )
-    if path is not None:
-        print(f"# файл: {path}", file=sys.stderr)
-
-    for ip in preview:
-        print(ip)
-    if total > len(preview):
-        print(f"# ...и ещё {total - len(preview):,} (см. --limit)", file=sys.stderr)
-    return 0
+    return StreamingResponse(body(), media_type="application/json")
 
 
-def check_output(path: Path, args) -> None:
-    if path.exists() and not (args.append or args.force):
-        raise ValueError(f"файл {path} уже существует; используйте --append или --force")
-
-
-def run_ct(args) -> int:
-    domain = args.ct.strip().lower()
-    try:
-        names = sources.ct_names(domain, max_pages=args.ct_pages)
-    except (ValueError, RuntimeError) as exc:
-        print(f"источник не ответил: {exc}", file=sys.stderr)
-        return 1
-
-    selected = names[: args.max_addresses or None]
-    rows = normalize.iter_resolved(
-        selected, workers=args.workers, include_ipv6=args.include_ipv6
-    )
-
-    path = None
-    preview: list[tuple[str, str]] = []
-    total = 0
-    try:
-        if args.no_save:
-            saved = 0
-            for ip, name in rows:
-                total += 1
-                if len(preview) < args.limit:
-                    preview.append((ip, name))
-        else:
-            path = store.output_path("ct", args.out)
-            check_output(path, args)
-            with store.Output(path, append=args.append) as out:
-                for ip, name in rows:
-                    total += 1
-                    if len(preview) < args.limit:
-                        preview.append((ip, name))
-                    out.write(f"{ip}\t{name}")
-            saved = out.count
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"ошибка записи или DNS: {exc}", file=sys.stderr)
-        return 1
-
-    print(
-        f"# {domain}: имён из CT {len(names)}, разрешено имён "
-        f"{len(selected)}, адресов {total}",
-        file=sys.stderr,
-    )
-    print(f"# записано {saved:,}", file=sys.stderr)
-    if path is not None:
-        print(f"# файл: {path}", file=sys.stderr)
-
-    for ip, name in preview:
-        print(f"{ip}  {name}")
-    if total > len(preview):
-        print(f"# ...и ещё {total - len(preview):,} (см. --limit)", file=sys.stderr)
-    return 0
-
-
-def run_shodan(args) -> int:
-    query = args.shodan.strip()
-    api_key = os.getenv("SHODAN_API_KEY", "").strip()
-    if not api_key:
-        print("нужен SHODAN_API_KEY в окружении или .env", file=sys.stderr)
-        return 1
-
-    stream = normalize.take(
-        sources.shodan_ips(query, api_key, max_pages=args.shodan_pages),
-        args.max_addresses or None,
-    )
-    preview: list[str] = []
-    total = 0
-    path = None
-    opened = False
-    try:
-        if args.no_save:
-            for ip in stream:
-                total += 1
-                if len(preview) < args.limit:
-                    preview.append(ip)
-            saved = 0
-        else:
-            path = store.output_path("shodan", args.out)
-            check_output(path, args)
-            with store.Output(path, append=args.append) as out:
-                opened = True
-                for ip in stream:
-                    total += 1
-                    if len(preview) < args.limit:
-                        preview.append(ip)
-                    out.write(ip)
-            saved = out.count
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"поиск Shodan не выполнен: {exc}", file=sys.stderr)
-        if opened:
-            print(f"# частичный файл: {path}", file=sys.stderr)
-        return 1
-
-    print(f"# Shodan: запрос {query!r}, уникальных адресов {total}, записано {saved}", file=sys.stderr)
-    if path is not None:
-        print(f"# файл: {path}", file=sys.stderr)
-    for ip in preview:
-        print(ip)
-    if total > len(preview):
-        print(f"# ...и ещё {total - len(preview):,} (см. --limit)", file=sys.stderr)
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("country", nargs="?", help="код страны из двух букв, например LI")
-    parser.add_argument("--ct", metavar="ДОМЕН", help="раскрыть домен через CT-логи")
-    parser.add_argument("--asn", metavar="AS123", help="анонсированные сети автономной системы")
-    parser.add_argument("--shodan", metavar="ЗАПРОС", help="найти IP через Shodan Search API")
-    parser.add_argument(
-        "--per-prefix", type=int, default=0, help="адресов из каждой сети; 0 = все IPv4"
-    )
-    parser.add_argument(
-        "--max-addresses",
-        type=int,
-        default=0,
-        help="остановиться после N адресов; в CT-маршруте — после N имён",
-    )
-    parser.add_argument("--no-ipv6", action="store_true", help="не включать IPv6")
-    parser.add_argument("--restart", action="store_true", help="начать заново, забыв курсор")
-    parser.add_argument(
-        "--limit", type=int, default=PREVIEW_LIMIT, help="сколько строк напечатать на экран"
-    )
-    parser.add_argument("--no-save", action="store_true", help="файл не писать, только показать")
-    parser.add_argument(
-        "--out",
-        metavar="ФАЙЛ",
-        help="куда писать результат; по умолчанию out/<маршрут>_<дата-время>.txt",
-    )
-    parser.add_argument("--append", action="store_true", help="дописывать в файл, а не заменять")
-    parser.add_argument("--force", action="store_true", help="разрешить замену существующего --out")
-    parser.add_argument("--workers", type=int, default=8, help="параллельных DNS-запросов для CT (1–32)")
-    parser.add_argument("--ct-pages", type=int, default=1, help="страниц Cert Spotter для CT (1–10)")
-    parser.add_argument("--shodan-pages", type=int, default=1, help="страниц Shodan (1–10)")
-    parser.add_argument("--include-ipv6", action="store_true", help="искать также AAAA-записи в CT-режиме")
-    parser.add_argument("--no-cache", action="store_true", help="не читать и не писать кэш ответов")
-    args = parser.parse_args(argv)
-
-    if sum(value is not None for value in (args.country, args.ct, args.asn, args.shodan)) != 1:
-        parser.error("укажите ровно одну цель: страну, --asn, --ct или --shodan")
-    if args.shodan is not None and not args.shodan.strip():
-        parser.error("--shodan требует непустой запрос")
-    if args.country is not None and (
-        len(args.country) != 2 or not args.country.isascii() or not args.country.isalpha()
-    ):
-        parser.error("код страны должен состоять из двух латинских букв")
-    if args.ct is not None and not args.ct.strip():
-        parser.error("--ct требует непустой домен")
-    if args.asn is not None:
-        number = args.asn.upper().removeprefix("AS")
-        if not number.isascii() or not number.isdecimal() or int(number) < 1:
-            parser.error("ASN должен иметь вид AS123 или 123")
-        args.asn = f"AS{int(number)}"
-    if args.per_prefix < 0 or args.max_addresses < 0 or args.limit < 0:
-        parser.error("числовые лимиты не могут быть отрицательными")
-    if not 1 <= args.workers <= 32:
-        parser.error("--workers должен быть в диапазоне 1–32")
-    if not 1 <= args.ct_pages <= 10:
-        parser.error("--ct-pages должен быть в диапазоне 1–10")
-    if not 1 <= args.shodan_pages <= 10:
-        parser.error("--shodan-pages должен быть в диапазоне 1–10")
-    if (args.ct or args.shodan) and (args.per_prefix or args.no_ipv6 or args.restart):
-        parser.error("--per-prefix, --no-ipv6 и --restart применимы только к сетям")
-    if not args.ct and (args.workers != 8 or args.ct_pages != 1 or args.include_ipv6):
-        parser.error("--workers, --ct-pages и --include-ipv6 применимы только к CT-режиму")
-    if not args.shodan and args.shodan_pages != 1:
-        parser.error("--shodan-pages применим только к Shodan-режиму")
-    if args.no_save and (args.out or args.append or args.force):
-        parser.error("--no-save нельзя сочетать с --out, --append или --force")
-    if args.append and (not args.out or args.force):
-        parser.error("--append требует --out и не сочетается с --force")
-    if args.force and not args.out:
-        parser.error("--force требует --out")
-
-    store.CACHE_ENABLED = not args.no_cache
-    if args.ct is not None:
-        return run_ct(args)
-    if args.shodan is not None:
-        return run_shodan(args)
-    if args.asn is not None:
-        return run_networks(args, kind="asn", resource=args.asn)
-    return run_networks(args, kind="country", resource=args.country)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def _addresses_in(network) -> int:
+    """Сколько адресов iter_from отдаст для одной сети (только IPv4)."""
+    if network.prefixlen < 31:  # iter_from пропускает адрес сети и broadcast
+        return network.num_addresses - 2
+    return network.num_addresses
