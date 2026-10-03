@@ -1,0 +1,14 @@
+name: "achaos-IP-Finder"
+services:
+  app:
+    build: 
+      context: ..
+      dockerfile: docker/dockerfile
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=UTF-8
+    volumes:
+      - ../:/app
+    ports:
+      - "8000:8000"
+    
